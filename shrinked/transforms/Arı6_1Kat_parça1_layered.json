@@ -1,0 +1,16 @@
+{
+  "s": 0.1,
+  "tx": 0.0,
+  "ty": 0.0,
+  "target": 14,
+  "pad_frac": 0.0,
+  "use_union_bbox": false,
+  "scale_stroke": false,
+  "constant_stroke_width": "0.010000000000000002",
+  "content_bbox": [
+    0.0,
+    0.0,
+    140.0,
+    140.0
+  ]
+}
