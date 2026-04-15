@@ -70,8 +70,8 @@ class HatchingFilterConfig:
         enabled:                Set False to skip hatching filter entirely.
     """
 
-    min_length: float = 2.0
-    max_diagonal_angle_deg: float = 15.0
+    min_length: float = 10.0
+    max_diagonal_angle_deg: float = 2.0
     enabled: bool = True
 
 
