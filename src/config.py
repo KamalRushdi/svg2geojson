@@ -76,6 +76,43 @@ class HatchingFilterConfig:
 
 
 @dataclass
+class DoorClosingConfig:
+    """Controls door/window gap closing via bounding-rect + wall-snap.
+
+    For each door/window instance:
+      1. Build a bounding rectangle from all primitive endpoints.
+      2. Filter mega-instances by area ratio (rect_area / total_area).
+      3. Search all 4 edges for coincident wall (boundary) segments.
+      4. Snap matching edges to the wall lines → correct wall thickness.
+      5. Edges without wall matches are the opening sides (kept as-is).
+
+    The resulting rectangle seals the wall gap and becomes a Door/Window
+    polygon feature in the final GeoJSON.
+
+    Attributes:
+        max_area_ratio:       Skip instances whose bounding rect area /
+                              total building area exceeds this ratio.
+                              Catches mega-instances that span the building.
+        wall_search_distance: Max perpendicular distance from a rect edge
+                              to consider a wall segment as coincident.
+        wall_angle_tolerance: Max angle difference (degrees) between a
+                              rect edge and a wall segment for "parallel".
+        min_rect_thickness:   Reject rectangles thinner than this
+                              (degenerate instances).
+        min_rect_opening:     Reject rectangles with shortest edge
+                              shorter than this.
+        enabled:              Set False to skip door/window closing.
+    """
+
+    max_area_ratio: float = 0.05
+    wall_search_distance: float = 0.5
+    wall_angle_tolerance: float = 10.0
+    min_rect_thickness: float = 0.1
+    min_rect_opening: float = 1.0
+    enabled: bool = True
+
+
+@dataclass
 class CleaningConfig:
     """Controls coordinate rounding, endpoint snapping, and degenerate removal.
 
@@ -158,6 +195,7 @@ class PipelineConfig:
 
     parsing: ParsingConfig = field(default_factory=ParsingConfig)
     hatching: HatchingFilterConfig = field(default_factory=HatchingFilterConfig)
+    door_closing: DoorClosingConfig = field(default_factory=DoorClosingConfig)
     cleaning: CleaningConfig = field(default_factory=CleaningConfig)
     polygonization: PolygonizationConfig = field(default_factory=PolygonizationConfig)
     classification: ClassificationConfig = field(default_factory=ClassificationConfig)
@@ -213,6 +251,21 @@ def load_config(path: Path | None = None) -> PipelineConfig:
             config.hatching.max_diagonal_angle_deg = h["max_diagonal_angle_deg"]
         if "enabled" in h:
             config.hatching.enabled = h["enabled"]
+
+    if "door_closing" in raw:
+        dc = raw["door_closing"]
+        if "max_area_ratio" in dc:
+            config.door_closing.max_area_ratio = dc["max_area_ratio"]
+        if "wall_search_distance" in dc:
+            config.door_closing.wall_search_distance = dc["wall_search_distance"]
+        if "wall_angle_tolerance" in dc:
+            config.door_closing.wall_angle_tolerance = dc["wall_angle_tolerance"]
+        if "min_rect_thickness" in dc:
+            config.door_closing.min_rect_thickness = dc["min_rect_thickness"]
+        if "min_rect_opening" in dc:
+            config.door_closing.min_rect_opening = dc["min_rect_opening"]
+        if "enabled" in dc:
+            config.door_closing.enabled = dc["enabled"]
 
     if "cleaning" in raw:
         c = raw["cleaning"]
