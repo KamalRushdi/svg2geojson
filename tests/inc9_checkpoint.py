@@ -52,7 +52,7 @@ def _compute_bounds(lines):
 
 
 def plot_two_panel(noded_lines, poly_result, save_path, sample_name,
-                   viewbox_height, input_count):
+                   viewbox_height, input_count, boundary_rects=None):
     """2-panel: noded lines (left) | polygons + dangles (right)."""
     mx, _ = _compute_bounds(noded_lines)
     xlim = mx * 1.05 if mx > 0 else viewbox_height * 1.5
@@ -64,6 +64,12 @@ def plot_two_panel(noded_lines, poly_result, save_path, sample_name,
     for ls in noded_lines:
         xs, ys = ls.xy
         ax1.plot(xs, ys, color="#a75c20", linewidth=0.5, alpha=0.8)
+
+    # Overlay boundary rectangle
+    if boundary_rects:
+        for rect in boundary_rects:
+            xs, ys = rect.xy
+            ax1.plot(xs, ys, color="black", linewidth=2.0, linestyle="--", label="Boundary")
     ax1.set_title(
         f"{sample_name}\nNoded lines ({input_count})",
         fontsize=9,
@@ -92,6 +98,12 @@ def plot_two_panel(noded_lines, poly_result, save_path, sample_name,
     for ce in poly_result.cut_edges:
         xs, ys = ce.xy
         ax2.plot(xs, ys, color="#ed702d", linewidth=1.0, alpha=0.8)
+
+    # Overlay boundary rectangle
+    if boundary_rects:
+        for rect in boundary_rects:
+            xs, ys = rect.xy
+            ax2.plot(xs, ys, color="black", linewidth=2.0, linestyle="--")
 
     # Legend
     ax2.plot([], [], color="#e03e9b", linewidth=1.5,
@@ -150,8 +162,17 @@ def main():
 
         # Parse -> filter hatching -> clean -> polygonize
         result = parse_svg(svg_path)
+
+        # Extract boundary rectangles (primitive_id >= 1000000)
+        boundary_rect_prims = [
+            p for p in result.all_primitives if p.primitive_id >= 1000000
+        ]
+        boundary_rects = [p.geometry for p in boundary_rect_prims]
+
         filtered = filter_hatching(result.boundary, HatchingFilterConfig())
-        cleaning = clean_geometry(filtered.kept, CleaningConfig())
+        # Include the SVG viewBox boundary rectangles in the polygonize
+        # input so wall segments at the SVG edge can close against them.
+        cleaning = clean_geometry(filtered.kept + boundary_rect_prims, CleaningConfig())
         poly = polygonize_lines(cleaning.lines, PolygonizationConfig())
 
         input_count = len(cleaning.lines)
@@ -162,6 +183,7 @@ def main():
             cleaning.lines, poly,
             OUTPUT_DIR / f"{sample_name}_polygonize.png",
             sample_name, result.viewbox_height, input_count,
+            boundary_rects=boundary_rects,
         )
 
     print("\nDone. Outputs in", OUTPUT_DIR)

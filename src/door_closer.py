@@ -1,20 +1,21 @@
-"""Close door and window gaps in the boundary set.
+"""Close door and window gaps in the boundary set with simple bounding rectangles.
 
 FloorplanCAD walls stop at door/window openings, leaving gaps that prevent
-polygonize() from forming closed room loops. This module constructs a
-closing rectangle for each door/window instance, then adds the rectangle
-edges to the boundary set.
+polygonize() from forming closed room loops. This module constructs an
+axis-aligned bounding rectangle for each door/window instance and adds
+the 4 rectangle edges to the boundary set so polygonize_full can close
+the wall loops.
 
-The closing rectangles also serve as Door/Window polygon features in the
-final GeoJSON output.
+Wall-thickness matching is deferred to a later step (door_resizer, post-Inc 10).
+After polygonization, each door/window's bounding rectangle will be resized
+to align with the adjacent wall polygon's thickness.
 
 Algorithm per door/window instance:
-  1. Build an axis-aligned bounding rectangle from all primitive endpoints.
-  2. Filter mega-instances by area ratio (rect_area / total_area).
-  3. For each of the 4 rectangle edges, search for coincident wall
-     segments (parallel + close).
-  4. Snap matching edges to the wall lines → correct wall thickness.
-  5. Edges without matches are the opening sides → keep as-is.
+  1. Collect endpoints of segment primitives (skip arcs — those are swing arms).
+  2. Build axis-aligned bounding rectangle from those endpoints.
+  3. Filter mega-instances by area ratio (rect_area / total_area).
+  4. Reject rectangles thinner than min_rect_thickness.
+  5. Emit 4 boundary LineStrings + one Door/Window RoomPolygon.
 
 Typical usage:
 
@@ -27,11 +28,11 @@ Typical usage:
 from __future__ import annotations
 
 import logging
-import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from shapely.geometry import LineString, Polygon, box
+import numpy as np
+from shapely.geometry import LineString, MultiPoint, Polygon, box
 
 from src.config import DoorClosingConfig
 from src.models import FloorplanPrimitive, RoomPolygon
@@ -69,16 +70,17 @@ def close_openings(
     boundary: list[FloorplanPrimitive],
     config: DoorClosingConfig | None = None,
 ) -> ClosingResult:
-    """Close door and window gaps by constructing wall-snapped rectangles.
+    """Close door/window gaps with simple axis-aligned bounding rectangles.
 
-    For each door/window instance (grouped by instance_id), builds a
-    bounding rectangle, snaps its edges to nearby wall segments, and
-    extracts the result as synthetic boundary primitives.
+    For each door/window instance (grouped by instance_id), builds an AABB
+    from the segment-primitive endpoints, validates it, and emits the 4
+    edges as boundary primitives plus the rectangle as a Door/Window polygon.
 
     Args:
         doors:    Door primitives from ParseResult.doors.
         windows:  Window primitives from ParseResult.windows.
-        boundary: Boundary primitives (walls) for wall-snap.
+        boundary: Boundary primitives — used only for total-area normalization
+                  in the mega-instance filter.
         config:   Closing thresholds. Uses DoorClosingConfig defaults if None.
 
     Returns:
@@ -93,18 +95,15 @@ def close_openings(
         logger.info("Door/window closing disabled, skipping")
         return result
 
-    # Collect wall LineStrings for wall-snap
     wall_lines = [
         p.geometry for p in boundary if isinstance(p.geometry, LineString)
     ]
-
-    # Compute total building area for mega-instance filtering
     total_area = _compute_total_area(wall_lines)
 
     # Process doors
     door_instances = _group_by_instance(doors)
     for iid, prims in door_instances.items():
-        rect = _build_wall_snapped_rect(prims, wall_lines, total_area, config)
+        rect = _build_bbox_rect(prims, total_area, config)
         if rect is None:
             result.skipped_instances.append((iid, "could not build rectangle"))
             continue
@@ -112,24 +111,38 @@ def close_openings(
         edges = _extract_rect_edges(rect, iid, prims[0].semantic_id)
         result.door_edges.extend(edges)
         result.door_polygons.append(
-            RoomPolygon(geometry=rect, facil_type="Door")
+            RoomPolygon(
+                geometry=rect, facil_type="Door", stroke=prims[0].stroke
+            )
         )
         result.door_count += 1
 
-    # Process windows
+    # Process windows — apply spatial multi-leg splitting if enabled
     window_instances = _group_by_instance(windows)
     for iid, prims in window_instances.items():
-        rect = _build_wall_snapped_rect(prims, wall_lines, total_area, config)
-        if rect is None:
-            result.skipped_instances.append((iid, "could not build rectangle"))
-            continue
+        if config.split_l_shaped_windows:
+            subgroups = _split_spatially(prims, config)
+        else:
+            subgroups = [prims]
 
-        edges = _extract_rect_edges(rect, iid, prims[0].semantic_id)
-        result.window_edges.extend(edges)
-        result.window_polygons.append(
-            RoomPolygon(geometry=rect, facil_type="Window")
-        )
-        result.window_count += 1
+        for sub_prims in subgroups:
+            rect = _build_bbox_rect(sub_prims, total_area, config)
+            if rect is None:
+                result.skipped_instances.append(
+                    (iid, "could not build rectangle")
+                )
+                continue
+
+            edges = _extract_rect_edges(rect, iid, sub_prims[0].semantic_id)
+            result.window_edges.extend(edges)
+            result.window_polygons.append(
+                RoomPolygon(
+                    geometry=rect,
+                    facil_type="Window",
+                    stroke=sub_prims[0].stroke,
+                )
+            )
+            result.window_count += 1
 
     logger.info(
         "Door closing: %d doors (%d edges), %d windows (%d edges), %d skipped",
@@ -173,33 +186,210 @@ def _group_by_instance(
     return dict(groups)
 
 
+def _split_spatially(
+    prims: list[FloorplanPrimitive],
+    config: DoorClosingConfig,
+) -> list[list[FloorplanPrimitive]]:
+    """Detect L/U/T-shaped instances via concavity and split via k-means.
+
+    Algorithm:
+      1. Concavity check — `convex_hull(endpoints).area / aabb.area`. If
+         the shape is convex enough, return [prims] (no split).
+      2. K-means clustering on segment midpoints for k=2..max_clusters,
+         picking the k with the highest silhouette score.
+      3. Reject the split if best silhouette < min_silhouette
+         (clusters too overlapping → not a real multi-leg shape).
+      4. Partition primitives by cluster; non-segment primitives assigned
+         to the cluster of the spatially-nearest segment.
+
+    Returns:
+        Single-element list [prims] when no split, else N-element list.
+    """
+    seg_prims: list[FloorplanPrimitive] = []
+    midpoints: list[tuple[float, float]] = []
+    for p in prims:
+        if not (
+            isinstance(p.geometry, LineString)
+            and p.original_type == "segment"
+        ):
+            continue
+        coords = list(p.geometry.coords)
+        if len(coords) < 2:
+            continue
+        mx = (coords[0][0] + coords[-1][0]) / 2
+        my = (coords[0][1] + coords[-1][1]) / 2
+        seg_prims.append(p)
+        midpoints.append((mx, my))
+
+    if len(seg_prims) < 4:
+        return [prims]
+
+    # Step 1: instance-area check — convex hull of all segment endpoints
+    # divided by AABB area. For a rectangle (even with sparse internal
+    # segments), endpoints reach the AABB corners → hull ≈ AABB → ratio
+    # near 1.0. An L/U/T-shape leaves part of the AABB unreachable by
+    # any endpoint → hull < AABB → ratio drops.
+    all_endpoints: list[tuple[float, float]] = []
+    for p in seg_prims:
+        all_endpoints.extend(p.geometry.coords)
+    xs = [c[0] for c in all_endpoints]
+    ys = [c[1] for c in all_endpoints]
+    aabb_area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+    if aabb_area <= 0:
+        return [prims]
+    try:
+        hull_area = MultiPoint(all_endpoints).convex_hull.area
+    except Exception:
+        return [prims]
+    if hull_area / aabb_area >= config.area_ratio_threshold:
+        return [prims]
+
+    # Step 2: try k=2..max_clusters, pick the LOWEST k whose silhouette
+    # exceeds min_silhouette. Prefer parsimony — for an L, k=2 already
+    # captures the structure; k=3 might score slightly higher by over-
+    # segmenting one leg, but that's not what we want.
+    pts = np.array(midpoints, dtype=float)
+    best_k = None
+    best_score = -1.0
+    best_labels: np.ndarray | None = None
+    for k in range(2, config.max_clusters + 1):
+        if k > len(pts):
+            break
+        labels = _kmeans(pts, k)
+        counts = np.bincount(labels, minlength=k)
+        if counts.min() < 2:
+            continue
+        score = _silhouette(pts, labels)
+        if score >= config.min_silhouette:
+            best_k = k
+            best_labels = labels
+            best_score = score
+            break  # take the lowest k that qualifies
+
+    if best_labels is None:
+        return [prims]
+
+    # Step 3: partition primitives by cluster assignment
+    final_clusters: list[list[FloorplanPrimitive]] = [
+        [] for _ in range(best_k)
+    ]
+    seg_id_to_cluster: dict[int, int] = {}
+    for sp, lbl in zip(seg_prims, best_labels):
+        ci = int(lbl)
+        final_clusters[ci].append(sp)
+        seg_id_to_cluster[id(sp)] = ci
+
+    # Distribute non-segment primitives by nearest segment-midpoint
+    cluster_centroids = np.array(
+        [pts[best_labels == ci].mean(axis=0) for ci in range(best_k)]
+    )
+    for p in prims:
+        if id(p) in seg_id_to_cluster:
+            continue
+        try:
+            ctr = p.geometry.centroid
+            cx, cy = ctr.x, ctr.y
+        except Exception:
+            final_clusters[0].append(p)
+            continue
+        d2 = ((cluster_centroids - np.array([cx, cy])) ** 2).sum(axis=1)
+        final_clusters[int(d2.argmin())].append(p)
+
+    # Drop empty clusters (shouldn't happen given the min-2 check above)
+    final_clusters = [c for c in final_clusters if c]
+    if len(final_clusters) <= 1:
+        return [prims]
+    return final_clusters
+
+
+def _kmeans(points: np.ndarray, k: int, max_iter: int = 30) -> np.ndarray:
+    """Lightweight k-means for small point sets. Returns int label per point."""
+    n = len(points)
+    if k >= n:
+        return np.arange(n) % k
+
+    # Initialize centroids: farthest-first traversal
+    centroids = [int(np.argmax(np.linalg.norm(points - points.mean(axis=0), axis=1)))]
+    for _ in range(1, k):
+        d2 = np.min(
+            np.array([
+                ((points - points[c]) ** 2).sum(axis=1) for c in centroids
+            ]),
+            axis=0,
+        )
+        centroids.append(int(np.argmax(d2)))
+    cs = points[centroids].copy()
+
+    labels = np.zeros(n, dtype=int)
+    for _ in range(max_iter):
+        # Assign each point to nearest centroid
+        d2 = ((points[:, None, :] - cs[None, :, :]) ** 2).sum(axis=2)
+        new_labels = d2.argmin(axis=1)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        # Update centroids
+        for ci in range(k):
+            mask = labels == ci
+            if mask.any():
+                cs[ci] = points[mask].mean(axis=0)
+    return labels
+
+
+def _silhouette(points: np.ndarray, labels: np.ndarray) -> float:
+    """Silhouette score in [-1, 1]. Higher = better-separated clusters."""
+    n = len(points)
+    unique = np.unique(labels)
+    if len(unique) < 2:
+        return 0.0
+    # Pairwise distance matrix
+    diff = points[:, None, :] - points[None, :, :]
+    dist = np.sqrt((diff ** 2).sum(axis=2))
+    scores = []
+    for i in range(n):
+        same = (labels == labels[i]) & (np.arange(n) != i)
+        if not same.any():
+            scores.append(0.0)
+            continue
+        a = dist[i, same].mean()
+        b = float("inf")
+        for c in unique:
+            if c == labels[i]:
+                continue
+            mask = labels == c
+            if mask.any():
+                b = min(b, dist[i, mask].mean())
+        denom = max(a, b)
+        scores.append((b - a) / denom if denom > 0 else 0.0)
+    return float(np.mean(scores))
+
+
 # ---------------------------------------------------------------------------
 # Per-instance rectangle construction
 # ---------------------------------------------------------------------------
 
 
-def _build_wall_snapped_rect(
+def _build_bbox_rect(
     prims: list[FloorplanPrimitive],
-    wall_lines: list[LineString],
     total_area: float,
     config: DoorClosingConfig,
 ) -> Polygon | None:
-    """Build a closing rectangle for one door/window instance.
+    """Build a simple axis-aligned bounding rectangle for one instance.
 
     Pipeline:
-      1. Axis-aligned bounding box from all primitive endpoints.
-      2. Mega-instance filter (area ratio).
-      3. Search all 4 edges for coincident wall segments.
-      4. Snap matching edges to wall lines.
+      1. Collect endpoints from segment primitives (skip arcs).
+      2. Compute AABB.
+      3. Reject if too small.
+      4. Mega-instance filter (area ratio).
+      5. Reject if thinner than min_rect_thickness.
     """
-    # Step 1: Collect endpoints from segment primitives only (exclude arcs).
-    # Arcs are swing arms that extend far into the room; segments are
-    # frame details within/near the wall thickness.
+    # Collect endpoints from segment primitives only — arcs are swing arms
+    # that extend far into the room and would distort the AABB.
     pts = []
     for p in prims:
         if isinstance(p.geometry, LineString) and p.original_type == "segment":
             pts.extend(list(p.geometry.coords))
-    # Fallback to all primitives if no segments
+    # Fallback to all linestring primitives if no segments
     if len(pts) < 2:
         pts = []
         for p in prims:
@@ -220,7 +410,6 @@ def _build_wall_snapped_rect(
     if width < config.min_rect_opening and height < config.min_rect_opening:
         return None
 
-    # Step 2: Mega-instance filter
     rect_area = width * height
     if total_area > 0 and rect_area / total_area > config.max_area_ratio:
         logger.debug(
@@ -230,158 +419,16 @@ def _build_wall_snapped_rect(
         )
         return None
 
-    # Build initial axis-aligned rectangle
     rect = box(min_x, min_y, max_x, max_y)
 
-    # Step 3 & 4: Search edges for coincident walls and snap
-    rect = _snap_to_walls(rect, wall_lines, config)
-
-    if rect is None or not rect.is_valid or rect.area < 0.01:
+    if not rect.is_valid or rect.area < 0.01:
         return None
 
-    # Final validation
-    short, long = _rect_dimensions(rect)
+    short, _long = _rect_dimensions(rect)
     if short < config.min_rect_thickness:
         return None
 
     return rect
-
-
-def _snap_to_walls(
-    rect: Polygon,
-    wall_lines: list[LineString],
-    config: DoorClosingConfig,
-) -> Polygon | None:
-    """Snap rectangle to wall face pair with the smallest gap.
-
-    Finds horizontal and vertical wall segments in/near the bounding box,
-    collects their positions, and finds the pair of parallel wall lines
-    with the smallest gap (= wall thickness). Snaps the corresponding
-    axis to this pair.
-
-    Only the across-wall axis is snapped; the along-wall axis (opening
-    width) is kept from the original bounding box.
-    """
-    min_x, min_y, max_x, max_y = rect.bounds
-    w = max_x - min_x
-    h = max_y - min_y
-    angle_tol = math.radians(config.wall_angle_tolerance)
-
-    # Search area: expand box by 50% to catch walls adjacent to opening
-    margin = max(w, h) * 0.5
-    sx0, sy0 = min_x - margin, min_y - margin
-    sx1, sy1 = max_x + margin, max_y + margin
-
-    horiz_ys = []  # y-positions of horizontal walls in/near box
-    vert_xs = []   # x-positions of vertical walls in/near box
-
-    for wl in wall_lines:
-        wl_c = list(wl.coords)
-        p1, p2 = wl_c[0], wl_c[-1]
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        wl_len = math.sqrt(dx * dx + dy * dy)
-        if wl_len < 0.01:
-            continue
-
-        wl_angle = math.atan2(abs(dy), abs(dx))
-        is_horiz = wl_angle < angle_tol
-        is_vert = wl_angle > math.pi / 2 - angle_tol
-
-        if is_horiz:
-            wl_y = (p1[1] + p2[1]) / 2
-            # Wall must be within expanded search area (y)
-            if wl_y < sy0 or wl_y > sy1:
-                continue
-            # Wall must be near the box laterally (x)
-            wl_xmin = min(p1[0], p2[0])
-            wl_xmax = max(p1[0], p2[0])
-            if wl_xmax < sx0 or wl_xmin > sx1:
-                continue
-            horiz_ys.append(wl_y)
-
-        elif is_vert:
-            wl_x = (p1[0] + p2[0]) / 2
-            if wl_x < sx0 or wl_x > sx1:
-                continue
-            wl_ymin = min(p1[1], p2[1])
-            wl_ymax = max(p1[1], p2[1])
-            if wl_ymax < sy0 or wl_ymin > sy1:
-                continue
-            vert_xs.append(wl_x)
-
-    # Find wall face pair: two parallel lines with smallest gap
-    horiz_pair = _find_wall_face_pair(horiz_ys, min_y, max_y)
-    vert_pair = _find_wall_face_pair(vert_xs, min_x, max_x)
-
-    # Apply the pair that gives the thinnest result (= wall thickness)
-    if horiz_pair is not None and vert_pair is not None:
-        h_gap = horiz_pair[1] - horiz_pair[0]
-        v_gap = vert_pair[1] - vert_pair[0]
-        if h_gap <= v_gap:
-            return box(min_x, horiz_pair[0], max_x, horiz_pair[1])
-        else:
-            return box(vert_pair[0], min_y, vert_pair[1], max_y)
-    elif horiz_pair is not None:
-        return box(min_x, horiz_pair[0], max_x, horiz_pair[1])
-    elif vert_pair is not None:
-        return box(vert_pair[0], min_y, vert_pair[1], max_y)
-
-    return rect
-
-
-def _find_wall_face_pair(
-    positions: list[float],
-    box_min: float,
-    box_max: float,
-) -> tuple[float, float] | None:
-    """Find the pair of wall lines with smallest gap within the box range.
-
-    Wall faces form pairs (inner + outer face of a wall). This finds the
-    tightest such pair within the bounding box range.
-
-    Returns (low, high) positions or None if no valid pair found.
-    """
-    if len(positions) < 2:
-        return None
-
-    # Deduplicate: round to 0.1 and take unique values
-    rounded = sorted(set(round(p, 1) for p in positions))
-    if len(rounded) < 2:
-        return None
-
-    # Find consecutive pair with smallest gap that's within the box
-    best_pair = None
-    best_gap = float("inf")
-    for i in range(len(rounded) - 1):
-        low, high = rounded[i], rounded[i + 1]
-        gap = high - low
-        # Gap must be reasonable wall thickness (0.3 to 5.0 units)
-        if gap < 0.3 or gap > 5.0:
-            continue
-        # Pair must be within or near the box range
-        if high < box_min - 1.0 or low > box_max + 1.0:
-            continue
-        if gap < best_gap:
-            best_gap = gap
-            best_pair = (low, high)
-
-    return best_pair
-
-
-# ---------------------------------------------------------------------------
-# Geometry helpers
-# ---------------------------------------------------------------------------
-
-
-def _angle_diff(a: float, b: float) -> float:
-    """Signed angle difference in [-pi, pi]."""
-    d = a - b
-    while d > math.pi:
-        d -= 2 * math.pi
-    while d < -math.pi:
-        d += 2 * math.pi
-    return d
 
 
 def _rect_dimensions(rect: Polygon) -> tuple[float, float]:
@@ -411,7 +458,7 @@ def _extract_rect_edges(
     Returns synthetic FloorplanPrimitive objects that can be added
     directly to the boundary set.
     """
-    coords = list(rect.exterior.coords)  # 5 points (closed ring)
+    coords = list(rect.exterior.coords)
     edges = []
     for i in range(len(coords) - 1):
         edge_geom = LineString([coords[i], coords[i + 1]])

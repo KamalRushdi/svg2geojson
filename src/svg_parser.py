@@ -138,6 +138,19 @@ def parse_svg(
             _flip_y(p, viewbox_height) for p in result.all_primitives
         ]
 
+    # --- Snap wall endpoints close to the SVG boundary onto it ---
+    # Wall segments often end slightly short of the SVG edge (e.g., 0.3
+    # units from y=140). Without this snap, those near-misses prevent
+    # polygons from closing against the boundary rectangle.
+    result.all_primitives = _snap_to_svg_boundary(
+        result.all_primitives, vb, viewbox_height, config.y_flip,
+        tolerance=config.boundary_snap_tolerance,
+    )
+
+    # --- Add boundary rectangle (4 LineStrings) ---
+    boundary_prims = _create_boundary_rectangle(vb, viewbox_height, config.y_flip)
+    result.all_primitives.extend(boundary_prims)
+
     # --- Group by semantic role ---
     for prim in result.all_primitives:
         if prim.semantic_id is None:
@@ -648,3 +661,151 @@ def _parse_path_element(
         layer=attrs["layer"],
         stroke=attrs["stroke"],
     )
+
+
+def _snap_to_svg_boundary(
+    prims: list[FloorplanPrimitive],
+    viewbox: tuple[float, float, float, float],
+    viewbox_height: float,
+    y_flip: bool,
+    tolerance: float,
+) -> list[FloorplanPrimitive]:
+    """Snap LineString endpoints close to SVG boundary edges onto those edges.
+
+    SVG drawings often have wall segments that end ~0.3 units short of the
+    SVG viewBox edge due to drawing imprecision. After we add the boundary
+    rectangle for polygonization, those near-misses still leave tiny gaps —
+    polygons can't close against the boundary because the wall endpoints
+    aren't exactly on it.
+
+    For each LineString primitive in `prims`, this function checks each
+    coordinate against the 4 viewBox edges (left, right, top, bottom).
+    If a coordinate is within `tolerance` of an edge, it's snapped to it.
+
+    Args:
+        prims:          List of FloorplanPrimitive to process.
+        viewbox:        SVG viewBox tuple (min_x, min_y, width, height).
+        viewbox_height: viewbox[3], passed for Y-flip math.
+        y_flip:         Whether Y was flipped during parsing.
+        tolerance:      Snap radius in SVG units.
+
+    Returns:
+        New list of FloorplanPrimitive (Line geometries snapped where
+        applicable; non-LineString geometries pass through unchanged).
+    """
+    if tolerance <= 0:
+        return prims
+
+    min_x, min_y, width, height = viewbox
+    max_x = min_x + width
+    max_y = min_y + height
+
+    if y_flip:
+        x_lo, x_hi = min_x, max_x
+        y_lo, y_hi = viewbox_height - max_y, viewbox_height - min_y
+    else:
+        x_lo, x_hi = min_x, max_x
+        y_lo, y_hi = min_y, max_y
+
+    def _snap(c: tuple[float, float]) -> tuple[float, float]:
+        x, y = c[0], c[1]
+        if abs(x - x_lo) < tolerance:
+            x = x_lo
+        elif abs(x - x_hi) < tolerance:
+            x = x_hi
+        if abs(y - y_lo) < tolerance:
+            y = y_lo
+        elif abs(y - y_hi) < tolerance:
+            y = y_hi
+        return (x, y)
+
+    out: list[FloorplanPrimitive] = []
+    for p in prims:
+        if isinstance(p.geometry, LineString):
+            new_coords = [_snap(c) for c in p.geometry.coords]
+            # Drop degenerate results (all points snapped to same location)
+            if len(set(new_coords)) >= 2:
+                new_geom = LineString(new_coords)
+                out.append(
+                    FloorplanPrimitive(
+                        geometry=new_geom,
+                        semantic_id=p.semantic_id,
+                        instance_id=p.instance_id,
+                        primitive_id=p.primitive_id,
+                        original_type=p.original_type,
+                        layer=p.layer,
+                        stroke=p.stroke,
+                    )
+                )
+            else:
+                out.append(p)  # keep original if snap made it degenerate
+        else:
+            out.append(p)
+    return out
+
+
+def _create_boundary_rectangle(
+    viewbox: tuple[float, float, float, float],
+    viewbox_height: float,
+    y_flip: bool,
+) -> list[FloorplanPrimitive]:
+    """Create 4 LineStrings forming a bounding rectangle from the viewBox.
+
+    Creates boundary lines for the edges of the SVG coordinate space.
+    After Y-flip, these represent the actual boundary of the geometry space.
+
+    Args:
+        viewbox:       Tuple of (min_x, min_y, width, height) from SVG viewBox.
+        viewbox_height: The height value from viewBox (same as viewbox[3]).
+        y_flip:        Whether Y-flip has been applied.
+
+    Returns:
+        List of 4 FloorplanPrimitive objects with LineString geometries,
+        one for each edge of the bounding rectangle. semantic_id is None
+        so they don't get grouped into semantic categories.
+    """
+    min_x, min_y, width, height = viewbox
+    max_x = min_x + width
+    max_y = min_y + height
+
+    if y_flip:
+        # After Y-flip, the coordinates are transformed as (x, viewbox_height - y)
+        # So the rectangle corners become:
+        # (min_x, min_y) -> (min_x, viewbox_height - min_y)
+        # (max_x, min_y) -> (max_x, viewbox_height - min_y)
+        # (max_x, max_y) -> (max_x, viewbox_height - max_y)
+        # (min_x, max_y) -> (min_x, viewbox_height - max_y)
+        p1 = (min_x, viewbox_height - min_y)
+        p2 = (max_x, viewbox_height - min_y)
+        p3 = (max_x, viewbox_height - max_y)
+        p4 = (min_x, viewbox_height - max_y)
+    else:
+        p1 = (min_x, min_y)
+        p2 = (max_x, min_y)
+        p3 = (max_x, max_y)
+        p4 = (min_x, max_y)
+
+    # 4 edges: bottom, right, top, left
+    edges = [
+        LineString([p1, p2]),  # bottom
+        LineString([p2, p3]),  # right
+        LineString([p3, p4]),  # top
+        LineString([p4, p1]),  # left
+    ]
+
+    # Assign primitive IDs starting from a large number to avoid conflicts
+    primitives = []
+    for i, edge in enumerate(edges):
+        primitives.append(
+            FloorplanPrimitive(
+                geometry=edge,
+                semantic_id=None,
+                instance_id=None,
+                primitive_id=1000000 + i,
+                original_type="boundary",
+                layer="boundary",
+                stroke="rgb(0, 0, 0)",
+            )
+        )
+
+    return primitives

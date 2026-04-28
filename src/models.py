@@ -67,6 +67,10 @@ class RoomPolygon:
                              "Elevator", "Bedroom", "Walkways", "Deadzone", "Wall",
                              "Door", or None if not yet classified.
         facil_name:          Optional human-readable name (e.g. "Room 201").
+        stroke:              Original SVG stroke color (CSS rgb string) of the
+                             primitives that produced this polygon. Set for
+                             Door/Window polygons so visualizations can match
+                             the SVG's semantic coloring.
         contained_semantics: Map of {semantic_id: count} for primitives inside
                              this room. Used by the classifier to decide facil_type.
                              Example: {28: 3, 35: 1} means 3 stair primitives and
@@ -76,6 +80,7 @@ class RoomPolygon:
     geometry: BaseGeometry
     facil_type: str | None = None
     facil_name: str | None = None
+    stroke: str | None = None
     contained_semantics: dict[int, int] = field(default_factory=dict)
 
 

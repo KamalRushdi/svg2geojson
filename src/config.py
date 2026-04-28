@@ -44,6 +44,12 @@ class ParsingConfig:
         window_semantic_ids:   IDs whose straight segments close window gaps.
         y_flip:                Flip Y-axis (SVG Y goes down, geometry Y goes up).
         arc_resolution:        Number of sample points when discretizing SVG arcs.
+        boundary_snap_tolerance: Distance (SVG units) within which a primitive
+                               endpoint near an SVG viewBox edge gets snapped
+                               onto that edge. Bridges the small drawing-
+                               imprecision gap between wall ends and the
+                               SVG boundary so polygonize_full can close
+                               polygons against the boundary rectangle.
     """
 
     boundary_semantic_ids: set[int] = field(default_factory=lambda: {33, 34})
@@ -51,6 +57,7 @@ class ParsingConfig:
     window_semantic_ids: set[int] = field(default_factory=lambda: {7})
     y_flip: bool = True
     arc_resolution: int = 20
+    boundary_snap_tolerance: float = 0.5
 
 
 @dataclass
@@ -77,38 +84,53 @@ class HatchingFilterConfig:
 
 @dataclass
 class DoorClosingConfig:
-    """Controls door/window gap closing via bounding-rect + wall-snap.
+    """Controls door/window gap closing via simple bounding-rect.
 
     For each door/window instance:
-      1. Build a bounding rectangle from all primitive endpoints.
+      1. Build an axis-aligned bounding rectangle from segment-primitive endpoints.
       2. Filter mega-instances by area ratio (rect_area / total_area).
-      3. Search all 4 edges for coincident wall (boundary) segments.
-      4. Snap matching edges to the wall lines → correct wall thickness.
-      5. Edges without wall matches are the opening sides (kept as-is).
+      3. Reject rectangles that are too thin or too small.
+      4. Emit 4 LineStrings (rectangle edges) into the boundary set so
+         polygonize_full can close adjacent wall loops.
 
-    The resulting rectangle seals the wall gap and becomes a Door/Window
-    polygon feature in the final GeoJSON.
+    Wall-thickness matching is deferred to a separate resize step
+    (door_resizer, post-Inc 10), where adjacent wall polygons are used
+    to determine the correct thickness.
 
     Attributes:
-        max_area_ratio:       Skip instances whose bounding rect area /
-                              total building area exceeds this ratio.
-                              Catches mega-instances that span the building.
-        wall_search_distance: Max perpendicular distance from a rect edge
-                              to consider a wall segment as coincident.
-        wall_angle_tolerance: Max angle difference (degrees) between a
-                              rect edge and a wall segment for "parallel".
-        min_rect_thickness:   Reject rectangles thinner than this
-                              (degenerate instances).
-        min_rect_opening:     Reject rectangles with shortest edge
-                              shorter than this.
-        enabled:              Set False to skip door/window closing.
+        max_area_ratio:     Skip instances whose bounding rect area /
+                            total building area exceeds this ratio.
+                            Catches mega-instances that span the building.
+        min_rect_thickness: Reject rectangles thinner than this
+                            (degenerate instances).
+        min_rect_opening:   Reject rectangles with shortest edge
+                            shorter than this.
+        split_l_shaped_windows: If True, detect multi-leg window instances
+                            via density check + spatial clustering and
+                            emit one rectangle per leg.
+        area_ratio_threshold: convex_hull(endpoints).area / aabb.area
+                            below which a window is treated as a multi-leg
+                            shape (potential L/U/T). Rectangles ~1.0; an
+                            L-shape with reasonable leg thickness is
+                            ~0.65–0.7. Default 0.75 cleanly separates
+                            real L-shapes from rectangles.
+        min_silhouette:     Minimum silhouette score for a k-means split
+                            to be accepted. Below this, clusters are too
+                            poorly separated and the window is kept
+                            as a single rectangle.
+        max_clusters:       Maximum k for k-means; tries k=2..max_clusters
+                            and picks the lowest k that exceeds
+                            min_silhouette.
+        enabled:            Set False to skip door/window closing.
     """
 
     max_area_ratio: float = 0.05
-    wall_search_distance: float = 0.5
-    wall_angle_tolerance: float = 10.0
     min_rect_thickness: float = 0.1
     min_rect_opening: float = 1.0
+    split_l_shaped_windows: bool = True
+    area_ratio_threshold: float = 0.75
+    min_silhouette: float = 0.3
+    max_clusters: int = 3
     enabled: bool = True
 
 
@@ -242,6 +264,8 @@ def load_config(path: Path | None = None) -> PipelineConfig:
             config.parsing.y_flip = p["y_flip"]
         if "arc_resolution" in p:
             config.parsing.arc_resolution = p["arc_resolution"]
+        if "boundary_snap_tolerance" in p:
+            config.parsing.boundary_snap_tolerance = p["boundary_snap_tolerance"]
 
     if "hatching" in raw:
         h = raw["hatching"]
@@ -256,14 +280,18 @@ def load_config(path: Path | None = None) -> PipelineConfig:
         dc = raw["door_closing"]
         if "max_area_ratio" in dc:
             config.door_closing.max_area_ratio = dc["max_area_ratio"]
-        if "wall_search_distance" in dc:
-            config.door_closing.wall_search_distance = dc["wall_search_distance"]
-        if "wall_angle_tolerance" in dc:
-            config.door_closing.wall_angle_tolerance = dc["wall_angle_tolerance"]
         if "min_rect_thickness" in dc:
             config.door_closing.min_rect_thickness = dc["min_rect_thickness"]
         if "min_rect_opening" in dc:
             config.door_closing.min_rect_opening = dc["min_rect_opening"]
+        if "split_l_shaped_windows" in dc:
+            config.door_closing.split_l_shaped_windows = dc["split_l_shaped_windows"]
+        if "area_ratio_threshold" in dc:
+            config.door_closing.area_ratio_threshold = dc["area_ratio_threshold"]
+        if "min_silhouette" in dc:
+            config.door_closing.min_silhouette = dc["min_silhouette"]
+        if "max_clusters" in dc:
+            config.door_closing.max_clusters = dc["max_clusters"]
         if "enabled" in dc:
             config.door_closing.enabled = dc["enabled"]
 

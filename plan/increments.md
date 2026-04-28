@@ -34,10 +34,14 @@ Each increment is a small, testable step. Mark `[x]` when done.
 
 ## Phase 1 continued: Door/Window Closing
 
-- [ ] **Inc 5: Door and window closing** — Add straight frame segments (originalType='segment') from door/window primitives to boundary set. Group by instanceId for context. Skip arc primitives (swing visuals).
-  - Checkpoint: boundary count increases, gaps at doors/windows visually sealed. Side-by-side plot: before (gaps) vs after (sealed).
-- [ ] **Inc 5.5: Synthetic closing (Strategy B)** — After polygonization attempt, find dangling wall endpoints within door-width distance, add synthetic closing lines for remaining gaps
-  - Checkpoint: dangle count decreases
+- [x] **Inc 5: Door and window closing (revised)** — Build a simple AABB rectangle per door/window instance from segment endpoints. Emit 4 LineStrings (rectangle edges) into the boundary set so polygonize_full can close adjacent wall loops. Wall-thickness matching is deferred to a post-Inc 10 resize step. See [plan/inc5_rework.md](inc5_rework.md).
+  - Checkpoint: [output/inc5_v2/](../output/inc5_v2/) — single bbox per instance.
+- [x] **Inc 5 v3: Multi-leg window splitting** — For window instances whose convex_hull/aabb area ratio is < 0.75 (concave envelope, indicating L/U/T-shape), run k-means on segment midpoints (k=2..3) and pick the lowest k whose silhouette score exceeds 0.3. Each cluster becomes its own bbox + 4 edges + RoomPolygon.
+  - Checkpoint: [output/inc5_v3/](../output/inc5_v3/) — GaziUni inst 10 splits into 2 thin rectangles, no false positives on regular rectangles.
+- [x] **Inc 5 SVG-boundary anchor** — Add a 4-LineString rectangle for the SVG viewBox (in [src/svg_parser.py](../src/svg_parser.py) `_create_boundary_rectangle`). Snap wall endpoints within `boundary_snap_tolerance` (default 0.5 SVG units) of any viewBox edge onto that edge so polygons can close cleanly against the SVG boundary.
+  - Checkpoint: total area of polygonization equals viewBox area on samples without internal voids; dangles drop dramatically.
+- [ ] **Inc 5 resize (deferred)** — After Inc 10 wall identification, find each door/window polygon's adjacent wall polygons and resize the door/window short axis to match the wall thickness. Re-polygonize so room polygons recover the area previously eaten by oversized door bboxes. See "Future Ideas" in [plan/inc5_rework.md](inc5_rework.md).
+  - Checkpoint: door/window polygons sit exactly within wall thickness; rooms expand to true size.
 
 ---
 
@@ -54,8 +58,10 @@ Each increment is a small, testable step. Mark `[x]` when done.
 
 ## Phase 3: Polygonization
 
-- [ ] **Inc 9: First polygonize attempt** — Run `polygonize_full` on noded lines. Print polygon/dangle/cut/invalid counts. Plot all polygons with random colors.
-  - Checkpoint: visually verify rooms are forming. This may require multiple iterations.
+- [x] **Inc 9: First polygonize attempt** — Run `polygonize_full` on noded lines. Print polygon/dangle/cut/invalid counts. Plot all polygons with random colors.
+  - Checkpoint: [output/inc9/](../output/inc9/) — rooms forming on all 5 samples.
+- [x] **Inc 9 + 5v3: Full pipeline checkpoint** — End-to-end pipeline (parse → hatching filter → close openings with multi-leg splitting → snap to SVG boundary → clean → polygonize). 3-panel plot: full building (semantic colors) | boundary only | polygonization with door/window overlays.
+  - Checkpoint: [output/inc9_inc5v3/](../output/inc9_inc5v3/).
 - [ ] **Inc 10: Separate outline, rooms, walls** — Identify building outline (union of all → exterior ring), filter wall-thickness polygons by configurable aspect ratio + area, keep rest as rooms
   - Checkpoint: plot outline (blue), rooms (green), walls (gray). Manual verification.
 - [ ] **Inc 11: Iterative gap-closing** — If room count too low, retry with higher snap tolerance. Report: tolerance → polygon_count → room_count for different values.
@@ -103,16 +109,16 @@ Each increment is a small, testable step. Mark `[x]` when done.
 ```
 Inc 0.1-0.3 (foundation)
   └─→ Inc 1 (segments) → Inc 2 (arcs) → Inc 3 (circles/ellipses)
-       └─→ Inc 4 (Y-flip + grouping)
+       └─→ Inc 4 (Y-flip + grouping) + SVG boundary rect + boundary-snap
             └─→ Inc 4.5 (hatching filter) ★ CRITICAL
-                 └─→ Inc 5 (door/window closing)
-                      │
-                      ├─→ Inc 6 → Inc 7 → Inc 8 (cleaning pipeline)
-                      │    └─→ Inc 9 (first polygonize) ★ HARDEST
-                      │         └─→ Inc 10 (separation) → Inc 11 (gap-closing)
-                      │              └─→ Inc 5.5 (synthetic closing, if needed)
-                      │
-                      └─→ Inc 12 (point-in-polygon) → Inc 13 (rules) → Inc 14 (heuristics)
+                 └─→ Inc 5 (bbox closing, no wall-snap)
+                      └─→ Inc 5 v3 (multi-leg window splitting via concavity + k-means)
+                           │
+                           ├─→ Inc 6 → Inc 7 → Inc 8 (cleaning pipeline)
+                           │    └─→ Inc 9 (first polygonize) ★ HARDEST
+                           │         └─→ Inc 10 (separation) → Inc 5 resize → Inc 11 (gap-closing)
+                           │
+                           └─→ Inc 12 (point-in-polygon) → Inc 13 (rules) → Inc 14 (heuristics)
 
 Inc 11 + Inc 14 → Inc 15 (affine) → Inc 16 (transform) → Inc 17 (export)
                    └─→ Inc 18 (CLI) → Inc 19 (2nd file) → Inc 20 (batch) → Inc 21 (validation)

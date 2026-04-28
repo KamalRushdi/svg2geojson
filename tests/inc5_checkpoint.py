@@ -10,11 +10,23 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 from shapely.geometry import LineString, Polygon
+
+
+def _parse_rgb(stroke: str | None, fallback: str) -> tuple[float, float, float] | str:
+    """Convert 'rgb(r, g, b)' to a matplotlib (r, g, b) tuple in [0, 1]."""
+    if not stroke:
+        return fallback
+    m = re.match(r"rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", stroke)
+    if not m:
+        return fallback
+    return (int(m.group(1)) / 255, int(m.group(2)) / 255, int(m.group(3)) / 255)
+
 
 # Ensure project root is on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -114,19 +126,21 @@ def plot_three_panel(parse_result, boundary, closing_result, save_path, sample_n
         vh, vw,
     )
 
-    # Overlay door rectangles in pink
+    # Overlay door rectangles using each instance's original SVG stroke color
     for dp in closing_result.door_polygons:
         if isinstance(dp.geometry, Polygon):
             xs, ys = dp.geometry.exterior.xy
-            ax3.fill(xs, ys, alpha=0.3, color="#e03e9b")
-            ax3.plot(xs, ys, color="#e03e9b", linewidth=1.5)
+            color = _parse_rgb(dp.stroke, "#e03e9b")
+            ax3.fill(xs, ys, alpha=0.3, color=color)
+            ax3.plot(xs, ys, color=color, linewidth=1.5)
 
-    # Overlay window rectangles in blue
+    # Overlay window rectangles using each instance's original SVG stroke color
     for wp in closing_result.window_polygons:
         if isinstance(wp.geometry, Polygon):
             xs, ys = wp.geometry.exterior.xy
-            ax3.fill(xs, ys, alpha=0.3, color="#604ef5")
-            ax3.plot(xs, ys, color="#604ef5", linewidth=1.5)
+            color = _parse_rgb(wp.stroke, "#604ef5")
+            ax3.fill(xs, ys, alpha=0.3, color=color)
+            ax3.plot(xs, ys, color=color, linewidth=1.5)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
