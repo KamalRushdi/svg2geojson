@@ -163,12 +163,58 @@ class PolygonizationConfig:
         max_snap_retry:           How many times to retry polygonization with
                                   increasing snap tolerance on low room count.
         snap_tolerance_increment: How much to increase snap_tolerance per retry.
+        separator_min_area:       Polygons with area below this are classified
+                                  as small walls/noise before any thickness
+                                  analysis (Inc 10).
+        separator_min_thickness:  Polygons with 2*inradius below this are
+                                  classified as walls (noise slivers) before
+                                  the dynamic threshold runs. Prevents the
+                                  gap detector from latching onto the
+                                  noise-vs-walls valley instead of the
+                                  walls-vs-rooms valley on bimodal/trimodal
+                                  thickness distributions.
+        separator_min_log_gap:    Minimum log10-thickness gap considered a clean
+                                  bimodal valley. If max gap < this, fall back
+                                  to Otsu's method.
+        separator_fallback_method: Threshold method when largest-gap fails.
+                                  "otsu" | "median" | "manual".
+        separator_manual_thickness: If set, override dynamic detection with this
+                                  hard-coded thickness threshold.
+        separator_column_max_area: Polygons with area at or below this AND
+                                  with oriented-bounding-box aspect ratio
+                                  >= separator_column_min_aspect are
+                                  classified as structural columns. Excluded
+                                  from rooms/walls and from the wall-merge
+                                  step so they keep their identity. Set
+                                  high enough to capture real pillars but
+                                  lower than typical small rooms.
+        separator_column_min_aspect: Minimum oriented-bounding-box aspect
+                                  ratio (short_side / long_side, range 0..1)
+                                  for a small polygon to count as a column.
+                                  0.6 accepts square-ish and slightly
+                                  elongated pillars; rectangular wall slivers
+                                  have aspect ~0.05 and fail this gate.
+        synth_wall_default_radius: Buffer radius used when synthesizing thin
+                                  wall polygons from single-line wall
+                                  LineStrings (Inc 10 Stage 5.5), used only
+                                  when the sample has zero wall polygons
+                                  to derive a median thickness from. Default
+                                  0.5 gives ~1.0 unit thick synthesized
+                                  walls.
     """
 
     min_room_area: float = 1.0
     wall_aspect_threshold: float = 0.08
     max_snap_retry: int = 3
     snap_tolerance_increment: float = 0.2
+    separator_min_area: float = 25.0
+    separator_min_thickness: float = 0.7
+    separator_min_log_gap: float = 0.2
+    separator_fallback_method: str = "otsu"
+    separator_manual_thickness: float | None = None
+    separator_column_max_area: float = 100.0
+    separator_column_min_aspect: float = 0.6
+    synth_wall_default_radius: float = 0.5
 
 
 @dataclass
@@ -314,6 +360,22 @@ def load_config(path: Path | None = None) -> PipelineConfig:
             config.polygonization.max_snap_retry = pg["max_snap_retry"]
         if "snap_tolerance_increment" in pg:
             config.polygonization.snap_tolerance_increment = pg["snap_tolerance_increment"]
+        if "separator_min_area" in pg:
+            config.polygonization.separator_min_area = pg["separator_min_area"]
+        if "separator_min_thickness" in pg:
+            config.polygonization.separator_min_thickness = pg["separator_min_thickness"]
+        if "separator_min_log_gap" in pg:
+            config.polygonization.separator_min_log_gap = pg["separator_min_log_gap"]
+        if "separator_fallback_method" in pg:
+            config.polygonization.separator_fallback_method = pg["separator_fallback_method"]
+        if "separator_manual_thickness" in pg:
+            config.polygonization.separator_manual_thickness = pg["separator_manual_thickness"]
+        if "separator_column_max_area" in pg:
+            config.polygonization.separator_column_max_area = pg["separator_column_max_area"]
+        if "separator_column_min_aspect" in pg:
+            config.polygonization.separator_column_min_aspect = pg["separator_column_min_aspect"]
+        if "synth_wall_default_radius" in pg:
+            config.polygonization.synth_wall_default_radius = pg["synth_wall_default_radius"]
 
     if "classification" in raw:
         cl = raw["classification"]
