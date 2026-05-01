@@ -1,15 +1,18 @@
-"""Inc 10 checkpoint: wall detection and merging.
+"""Inc 13 checkpoint: rule-based room type classification.
 
 Pipeline:
-    parse -> filter hatching -> close openings -> clean -> polygonize -> SEPARATE
+    parse -> filter hatching -> close openings -> clean -> polygonize
+        -> SEPARATE (with Inc 12 object-room locking)
+        -> CLASSIFY (Inc 13: assign facil_type from contained_semantics)
 
 Generates a 3-panel comparison plot per sample:
   Panel 1 - Original SVG primitives (walls in stroke colors, windows in blue)
   Panel 2 - Polygonization result (random colors per polygon)
-  Panel 3 - Walls only (merged walls in gray)
+  Panel 3 - Classified rooms colored by facil_type, walls in gray,
+            doors/windows in semantic color
 
 Usage:
-    .venv/bin/python -m tests.inc10_checkpoint
+    .venv/bin/python -m tests.inc13_checkpoint
 """
 
 from __future__ import annotations
@@ -27,6 +30,13 @@ from shapely.geometry import LineString, Polygon
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.classifier import (
+    TYPE_COLORS,
+    classification_summary,
+    classify_by_geometry,
+    classify_rooms,
+    reclassify_kitchen_near_wc,
+)
 from src.cleaning import clean_geometry
 from src.config import (
     CleaningConfig,
@@ -36,8 +46,19 @@ from src.config import (
 )
 from src.door_closer import close_openings
 from src.hatching_filter import filter_hatching
+from src.models import (
+    ELEVATOR_IDS,
+    ESCALATOR_IDS,
+    FURNITURE_IDS,
+    KITCHEN_IDS,
+    PARKING_IDS,
+    RAILING_IDS,
+    ROW_CHAIR_IDS,
+    STAIR_IDS,
+    TOILET_IDS,
+)
 from src.polygonizer import polygonize_lines
-from src.separator import SeparatorResult, separate_polygons
+from src.separator import SeparatorResult, _instance_centroids, separate_polygons
 from src.svg_parser import parse_svg
 
 logging.basicConfig(level=logging.INFO, format="%(name)s — %(message)s")
@@ -50,11 +71,38 @@ SAMPLES = [
     Path("input/sample/ESKİŞEHİR_ADLİYESİ_1.KAT_parça15.svg"),
     Path("input/sample/GaziUni_2Kat_parça2.svg"),
 ]
-OUTPUT_DIR = Path("output/inc10")
+OUTPUT_DIR = Path("output/inc13")
 
 WINDOW_BLUE = "#2563eb"
 WALL_GRAY = "#6b7280"
 WALL_EDGE = "#1f2937"
+UNCLASSIFIED_FILL = "#ffffff"
+UNCLASSIFIED_EDGE = "#9ca3af"
+
+# Centroid markers — each classification primitive's centroid plotted as a
+# small dot in Panel 3 so we can see WHERE the lock is probing. Colors
+# match the room-type palette so a stair primitive's centroid is yellow,
+# a toilet's is pink, etc.
+CENTROID_MARKERS = [
+    (STAIR_IDS,      "#f7ce4b", "Stairs"),
+    (ESCALATOR_IDS,  "#f7ce4b", "Escalator"),
+    (ELEVATOR_IDS,   "#ed702d", "Elevator"),
+    (TOILET_IDS,     "#ee7ca2", "WC"),
+    (KITCHEN_IDS,    "#719752", "Kitchen"),
+    (ROW_CHAIR_IDS,  "#426b51", "Auditorium"),
+    (FURNITURE_IDS,  "#7ab591", "Office"),
+    (PARKING_IDS,    "#66433e", "Parking"),
+    (RAILING_IDS,    "#403469", "Railing"),
+]
+
+
+def _centroid_color(sem_id: int | None) -> str | None:
+    if sem_id is None:
+        return None
+    for ids, color, _ in CENTROID_MARKERS:
+        if sem_id in ids:
+            return color
+    return None
 
 
 def _parse_rgb(stroke: str | None, fallback: str):
@@ -110,6 +158,7 @@ def _fill_polygon(ax, poly: Polygon, *, facecolor, edgecolor="black",
 def plot_three_panel(
     parse_result, noded_lines, poly_result, sep: SeparatorResult,
     save_path, sample_name, viewbox_height, boundary_rects=None,
+    classification_primitives=None,
 ):
     mx, _ = _compute_bounds(noded_lines)
     xlim = mx * 1.05 if mx > 0 else viewbox_height * 1.5
@@ -129,7 +178,6 @@ def plot_three_panel(
             xs, ys = p.geometry.xy
             color = _parse_rgb(p.stroke, "#e03e9b")
             ax1.plot(xs, ys, color=color, linewidth=0.5, alpha=0.6)
-    # Windows always blue regardless of original stroke.
     for p in parse_result.windows:
         if isinstance(p.geometry, LineString):
             xs, ys = p.geometry.xy
@@ -141,11 +189,7 @@ def plot_three_panel(
             ax1.plot(xs, ys, color=color, linewidth=0.3, alpha=0.4)
     ax1.set_title(f"{sample_name}\nOriginal SVG (windows in blue)", fontsize=10)
 
-    # Build a canonical color map for door/window polygons. Polygon objects
-    # in poly_result.polygons are the same instances the separator wraps in
-    # sep.doors / sep.windows, so id()-based lookup is reliable. Wherever a
-    # door/window polygon gets drawn (Panel 2 raw, Panel 3 classified), it
-    # uses its semantic color — random/role colors only fill the rest.
+    # ---- Panel 2: polygonization output (semantic colors for openings) ----
     semantic_color: dict[int, tuple] = {}
     for d in sep.doors:
         if isinstance(d.geometry, Polygon):
@@ -154,7 +198,6 @@ def plot_three_panel(
         if isinstance(w.geometry, Polygon):
             semantic_color[id(w.geometry)] = WINDOW_BLUE
 
-    # ---- Panel 2: polygonization output (semantic colors for openings) ----
     np.random.seed(42)
     for poly in poly_result.polygons:
         sem = semantic_color.get(id(poly))
@@ -169,7 +212,22 @@ def plot_three_panel(
         fontsize=10,
     )
 
-    # ---- Panel 3: walls (with columns folded in) + door/window overlay ----
+    # ---- Panel 3: classified rooms + walls + door/window overlay ----
+    # Sort largest polygons first so smaller real rooms paint on top —
+    # matters because the SVG-exterior leftover (full-canvas polygon) is
+    # always huge and would otherwise cover real rooms.
+    rooms_in_z_order = sorted(sep.rooms, key=lambda r: -r.geometry.area)
+    for r in rooms_in_z_order:
+        if not isinstance(r.geometry, Polygon):
+            continue
+        if r.facil_type and r.facil_type in TYPE_COLORS:
+            color = TYPE_COLORS[r.facil_type]
+            _fill_polygon(ax3, r.geometry, facecolor=color, alpha=0.65,
+                          edgecolor=color, linewidth=0.4)
+        else:
+            _fill_polygon(ax3, r.geometry, facecolor=UNCLASSIFIED_FILL,
+                          alpha=0.5, edgecolor=UNCLASSIFIED_EDGE,
+                          linewidth=0.4)
     for w in sep.merged_walls:
         _fill_polygon(ax3, w, facecolor=WALL_GRAY, alpha=0.85,
                       edgecolor=WALL_EDGE, linewidth=0.6)
@@ -183,12 +241,34 @@ def plot_three_panel(
             color = semantic_color[id(w.geometry)]
             _fill_polygon(ax3, w.geometry, facecolor=color, alpha=0.85,
                           edgecolor=color, linewidth=0.6)
+
+    # Overlay one centroid per OBJECT INSTANCE (not per primitive) — the
+    # exact same points the locker tests. A primitive-level centroid
+    # cloud scatters across drawing strokes and many fall on walls; the
+    # instance centroid is the average and lands near the object's true
+    # center. If a dot lands in a wall (or outside any polygon), the
+    # corresponding object failed to lock a room.
+    if classification_primitives:
+        for sem, pt in _instance_centroids(classification_primitives):
+            color = _centroid_color(sem)
+            if color is None or pt.is_empty:
+                continue
+            cx, cy = pt.coords[0]
+            ax3.plot(cx, cy, marker="o", markersize=6.0,
+                     markerfacecolor=color,
+                     markeredgecolor="black", markeredgewidth=0.6,
+                     linestyle="", alpha=0.95)
+
+    summary = classification_summary(sep.rooms)
+    summary_str = ", ".join(f"{k}={v}" for k, v in sorted(summary.items())) \
+        or "none"
+    legend_str = "  ".join(
+        f"[{lab}]" for lab in TYPE_COLORS if summary.get(lab)
+    )
     ax3.set_title(
-        f"{sample_name}\nWalls ({sep.stats.merged_wall_count} merged "
-        f"from {sep.stats.wall_count}, incl. {sep.stats.column_count} columns "
-        f"+ {sep.stats.synth_wall_count} synthesized) "
-        f"+ doors ({sep.stats.door_count}) + windows ({sep.stats.window_count})",
-        fontsize=10,
+        f"{sample_name}\nClassified rooms ({sum(summary.values())} total): "
+        f"{summary_str}\n{legend_str}",
+        fontsize=9,
     )
 
     for ax in axes:
@@ -208,27 +288,25 @@ def plot_three_panel(
 
 
 def print_summary(sample_name, sep: SeparatorResult, raw_count: int):
+    summary = classification_summary(sep.rooms)
     print(f"\n{'='*60}")
     print(f"{sample_name}")
     print(f"{'='*60}")
     print(f"  Raw polygons:           {raw_count}")
     print(f"  Threshold method:       {sep.stats.threshold_method}")
-    print(f"  Thickness threshold:    {sep.stats.thickness_threshold:.3f}")
-    print(f"  Largest log10-gap:      {sep.stats.largest_gap_size:.3f}")
-    print(f"  Thickness percentiles:  "
-          f"p10={sep.stats.thickness_p10:.2f}  "
-          f"p50={sep.stats.thickness_p50:.2f}  "
-          f"p90={sep.stats.thickness_p90:.2f}")
-    print(f"  Walls (raw):            {sep.stats.wall_count}"
-          f"  (small/dropped: {sep.stats.small_wall_count}, "
-          f"columns folded in: {sep.stats.column_count})")
-    print(f"  Walls (merged):         {sep.stats.merged_wall_count}")
-    print(f"  Walls (synthesized):    {sep.stats.synth_wall_count}"
-          f"  (single-line walls buffered)")
-    print(f"  Hatched polygons:       {sep.stats.hatched_wall_count}"
-          f"  (calibrated threshold: {sep.stats.hatching_calibrated})")
-    print(f"  Doors:                  {sep.stats.door_count}")
-    print(f"  Windows:                {sep.stats.window_count}")
+    print(f"  Locked rooms (Inc 12):  {sep.stats.locked_room_count}"
+          f"  (overruled by hatching: "
+          f"{sep.stats.locked_overruled_by_hatching_count})")
+    print(f"  Total rooms:            {sep.stats.room_count}")
+    print(f"  Doors / Windows:        {sep.stats.door_count} "
+          f"/ {sep.stats.window_count}")
+    print(f"  facil_type breakdown:")
+    for label in TYPE_COLORS:
+        if summary.get(label):
+            print(f"    {label:12s}        {summary[label]}")
+    if summary.get("Unclassified"):
+        print(f"    Unclassified         {summary['Unclassified']}"
+              f"  (no objects inside; Inc 14 will assign)")
 
 
 def main():
@@ -251,24 +329,15 @@ def main():
 
         filtered = filter_hatching(result.boundary, HatchingFilterConfig())
         boundary = filtered.kept
-        # Capture wall LineStrings BEFORE they get mixed with door/window
-        # edges; Stage 5.5 needs original wall provenance to synthesize
-        # single-line walls.
         wall_lines = [
             p.geometry for p in boundary
             if isinstance(p.geometry, LineString)
         ]
-        # Hatching strokes that the filter removed — used by the separator
-        # as ground truth to calibrate the wall/room thickness threshold.
         hatching_lines = [
             p.geometry for p in filtered.removed
             if isinstance(p.geometry, LineString)
         ]
 
-        # Add door/window edges so wall loops actually close into rooms; the
-        # separator IoU-matches the resulting AABB polygons against
-        # closing.door_polygons / closing.window_polygons so they're excluded
-        # from the wall classification.
         closing = close_openings(result.doors, result.windows, boundary, door_cfg)
         combined = (
             boundary
@@ -288,13 +357,22 @@ def main():
             classification_primitives=result.classification,
         )
 
+        # Inc 13: assign facil_type from contained_semantics.
+        classify_rooms(sep.rooms)
+        # Inc 13 refinement: a sink adjacent to a WC is a handwashing sink,
+        # not a kitchen sink — reclassify those Kitchen rooms as WC.
+        reclassify_kitchen_near_wc(sep.rooms)
+        # Inc 14: classify the rest by aspect ratio of the OBB.
+        classify_by_geometry(sep.rooms)
+
         print_summary(sample_name, sep, len(poly.polygons))
 
         plot_three_panel(
             result, cleaning.lines, poly, sep,
-            OUTPUT_DIR / f"{sample_name}_separated.png",
+            OUTPUT_DIR / f"{sample_name}_classified.png",
             sample_name, result.viewbox_height,
             boundary_rects=boundary_rects,
+            classification_primitives=result.classification,
         )
 
     print("\nDone. Outputs in", OUTPUT_DIR)

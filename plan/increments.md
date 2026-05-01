@@ -64,20 +64,21 @@ Each increment is a small, testable step. Mark `[x]` when done.
   - Checkpoint: [output/inc9_inc5v3/](../output/inc9_inc5v3/).
 - [x] **Inc 10: Separate rooms, walls, columns** — Inputs are partial SVG slices (a piece of a larger drawing), so we do NOT identify a separate "exterior region" — every polygon is a candidate. Pipeline (in [src/separator.py](../src/separator.py)): (1) split off door/window AABBs by IoU and propagate semantic stroke colors; (1.5) match hatching strokes (kept from `filter_hatching().removed`) to polygons via STRtree+midpoint containment to mark 100%-confidence walls; (2) drop noise via min-area (small ones routed to walls); (2.5) classify structural columns (small + roughly square via OBB aspect, folded into walls); (3) min-thickness sliver filter; (4) dynamic threshold on log₁₀(thickness) — largest-gap with Otsu fallback, then **calibrate up** if any hatched polygon would otherwise be misclassified as a room; (5) classify rooms vs walls; (5.5) synthesize thin walls from leftover wall LineStrings (single-line walls buffered with cap_style=2 at 0.2 × median thickness); (6) union-find merge connected wall slivers; (7) compute outline as silhouette of the visible polygons (`unary_union → exterior ring`) — a diagnostic for the visible slice, not a "building footprint".
   - Checkpoint: [output/inc10/](../output/inc10/) — 3-panel plot per sample (original SVG | polygonization with semantic-colored doors/windows | walls + doors + windows in semantic colors). Verified on 5 samples; ABLOK's hatching calibration raised threshold 1.978 → 4.996; ARI 8 single-line walls now visible via Stage 5.5.
-- [ ] **Inc 11: Iterative gap-closing** — If room count too low, retry with higher snap tolerance. Report: tolerance → polygon_count → room_count for different values.
+- [ ] **Inc 11 (deferred)** — Iterative gap-closing tolerance sweep. Skipped for now: Inc 10 produces rooms on all 5 samples, so the sweep is unnecessary. Re-run only if a future sample shows obviously-too-few rooms (huge merged polygons, high dangle count).
   - Checkpoint: find sweet spot where room count stabilizes
 
 ---
 
 ## Phase 4: Room Classification
 
-- [ ] **Inc 12: Point-in-polygon assignment** — For each room, find classification primitives inside it using `intersects()`. Group by instanceId for furniture.
-  - Checkpoint: rooms with stairs/toilet/kitchen primitives correctly identified
-  - **Backstop for Inc 10 misclassifications**: a polygon containing classification primitives (desk, toilet, sink, stairs, etc.) is a 100%-confidence room. If Inc 10's thickness threshold (now hatching-calibrated, see [src/separator.py](../src/separator.py)) sweeps too wide and tags such a polygon as a wall, this stage should reclaim it as a room — symmetric to how hatching is used as ground-truth walls in Stage 4.
-- [ ] **Inc 13: Rule-based classification** — Apply priority rules: stairs > elevator > WC > kitchen > default (no bed/bath in poilabs dataset)
-  - Checkpoint: Counter of facil_types shows expected distribution. Plot rooms colored by type.
-- [ ] **Inc 14: Geometric heuristics for unlabeled rooms** — Elongated → Walkways, tiny → Deadzone, default → Office
-  - Checkpoint: zero rooms with facil_type "Unknown"
+See [inc13_decisions.md](inc13_decisions.md) for the full decision tree, design rationale, and knobs to tune.
+
+- [x] **Inc 12: Object-room lock** — In separator stage 1.6, lock any polygon containing the **instance** centroid of a classification primitive (toilet, sink, stairs, elevator, sofa, chair, table, cabinet, parking, railing, escalator, row-chair) as a 100%-confidence room. Symmetric to hatching → 100%-walls. Hatching wins ties. Locked rooms bypass noise/column/sliver/threshold filters. Implemented in [src/separator.py](../src/separator.py) `_lock_object_rooms` + `_instance_centroids`.
+  - Checkpoint: [output/inc13/](../output/inc13/) panel 3 — locked rooms visible in semantic colors with object-instance centroid dots overlaid.
+- [x] **Inc 13: Rule-based classification** — Walk priority list `Stairs > Escalator > Elevator > WC > Kitchen > Auditorium > Office > Parking` over each room's `contained_semantics`. First match wins. Then refinement: any Kitchen polygon within 5 SVG units of a WC gets reclassified to WC (sinks adjacent to WCs are handwashing sinks, not kitchen sinks). Implemented in [src/classifier.py](../src/classifier.py) `classify_rooms` + `reclassify_kitchen_near_wc`.
+  - Checkpoint: [output/inc13/](../output/inc13/) — rooms colored by SVG-derived palette (Stairs yellow, WC pink, Office light-green, etc.).
+- [x] **Inc 14: Geometric heuristics for unlabeled rooms** — Walkway when **either** thickness < 14.0 (narrow corridor regardless of length) **OR** solidity < 0.8 (L/U/T-shaped corridor that turns a corner). Otherwise Office. Implemented in [src/classifier.py](../src/classifier.py) `classify_by_geometry`.
+  - Checkpoint: zero rooms with facil_type `None` after this stage. Walkways render in smoked-white `#e5e7eb`.
 
 ---
 

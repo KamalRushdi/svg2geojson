@@ -51,7 +51,7 @@ from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
 from src.config import PolygonizationConfig
-from src.models import RoomPolygon
+from src.models import FloorplanPrimitive, RoomPolygon
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,8 @@ class SeparatorStats:
     synth_wall_count: int = 0
     hatched_wall_count: int = 0
     hatching_calibrated: bool = False
+    locked_room_count: int = 0
+    locked_overruled_by_hatching_count: int = 0
     thickness_p10: float = 0.0
     thickness_p50: float = 0.0
     thickness_p90: float = 0.0
@@ -83,7 +85,10 @@ class SeparatorResult:
     """Result of the outline / rooms / walls separation.
 
     Attributes:
-        rooms:           Polygons classified as interior rooms.
+        rooms:           RoomPolygons classified as interior rooms. Each
+                         carries `contained_semantics` populated by Inc 12
+                         (object-bearing rooms locked to room status).
+                         Empty dict for threshold-classified rooms.
         walls:           Individual wall slivers (post-classification, pre-merge).
         merged_walls:    Walls unioned by connected component into bigger objects.
         wall_components: For each merged wall, the indices into `walls` it came
@@ -101,7 +106,7 @@ class SeparatorResult:
         stats:           Diagnostic counts and threshold info.
     """
 
-    rooms: list[Polygon] = field(default_factory=list)
+    rooms: list[RoomPolygon] = field(default_factory=list)
     walls: list[Polygon] = field(default_factory=list)
     merged_walls: list[Polygon] = field(default_factory=list)
     wall_components: list[list[int]] = field(default_factory=list)
@@ -118,6 +123,7 @@ def separate_polygons(
     window_polygons: list[RoomPolygon] | None = None,
     wall_lines: list[LineString] | None = None,
     hatching_lines: list[LineString] | None = None,
+    classification_primitives: list[FloorplanPrimitive] | None = None,
 ) -> SeparatorResult:
     """Run the Inc 10 separator on a list of polygons from polygonize_full.
 
@@ -144,6 +150,15 @@ def separate_polygons(
                          is raised so they all land on the wall side.
                          Calibration only ever raises the threshold, never
                          lowers it. None disables calibration.
+        classification_primitives:
+                         Non-boundary, non-opening primitives (stairs, toilets,
+                         sinks, furniture, elevators, etc.). A polygon whose
+                         interior contains the centroid of any such primitive
+                         is locked as a 100%-room — bypasses noise/column/
+                         sliver/threshold filters and goes straight into
+                         result.rooms with `contained_semantics` populated.
+                         Hatching wins ties: a polygon that is both hatched
+                         and object-bearing stays a wall. None disables this.
 
     Returns:
         SeparatorResult with rooms, walls, merged walls, doors, windows,
@@ -183,10 +198,34 @@ def separate_polygons(
         hatched_ids = _match_hatching_to_polygons(candidates, hatching_lines)
         result.stats.hatched_wall_count = len(hatched_ids)
 
+    # Stage 1.6: lock object-bearing polygons as 100%-rooms (Inc 12). A
+    # polygon containing the centroid of a classification primitive (stairs,
+    # toilet, sink, furniture, elevator, ...) is a real room regardless of
+    # thickness. Hatching wins ties: an already-hatched polygon stays a wall
+    # even if it happens to contain an object centroid.
+    object_room_ids: set[int] = set()
+    room_semantics: dict[int, dict[int, int]] = {}
+    if classification_primitives:
+        object_room_ids, room_semantics, overruled = _lock_object_rooms(
+            candidates, classification_primitives, hatched_ids,
+        )
+        result.stats.locked_room_count = len(object_room_ids)
+        result.stats.locked_overruled_by_hatching_count = overruled
+
+    # Pull locked rooms out of the candidate stream — they bypass
+    # noise/column/sliver/threshold and go straight to result.rooms.
+    locked_polys: list[Polygon] = []
+    candidates_remaining: list[Polygon] = []
+    for p in candidates:
+        if id(p) in object_room_ids:
+            locked_polys.append(p)
+        else:
+            candidates_remaining.append(p)
+
     # Stage 2: min-area filter (small -> walls)
     small_walls: list[Polygon] = []
     sized: list[Polygon] = []
-    for p in candidates:
+    for p in candidates_remaining:
         if p.area < config.separator_min_area:
             small_walls.append(p)
         else:
@@ -239,16 +278,29 @@ def separate_polygons(
     result.stats.thickness_threshold = threshold
 
     # Stage 5: classify
-    rooms: list[Polygon] = []
+    threshold_rooms: list[Polygon] = []
     big_walls: list[Polygon] = []
     for p, t in zip(sized_after_thickness, sized_thicknesses):
         if t < threshold:
             big_walls.append(p)
         else:
-            rooms.append(p)
-    result.rooms = rooms
+            threshold_rooms.append(p)
+
+    # Wrap rooms (threshold-classified + Inc 12 locked) into RoomPolygon.
+    # Threshold rooms have no objects inside by construction (any polygon
+    # containing an object centroid was pulled out at Stage 1.6), so their
+    # contained_semantics is {}.
+    rooms_out: list[RoomPolygon] = [
+        RoomPolygon(geometry=p, contained_semantics={}) for p in threshold_rooms
+    ]
+    for p in locked_polys:
+        rooms_out.append(RoomPolygon(
+            geometry=p,
+            contained_semantics=room_semantics.get(id(p), {}),
+        ))
+    result.rooms = rooms_out
     result.walls = small_walls + sliver_walls + big_walls + columns
-    result.stats.room_count = len(rooms)
+    result.stats.room_count = len(result.rooms)
     result.stats.wall_count = len(result.walls)
 
     # Stage 5.5: synthesize thin walls from single-line wall LineStrings.
@@ -257,8 +309,9 @@ def separate_polygons(
     # forms). We detect those geometrically and buffer them into thin
     # rectangles so the wall map is complete.
     if wall_lines:
+        room_geoms = [r.geometry for r in result.rooms if isinstance(r.geometry, Polygon)]
         synth = _synthesize_single_line_walls(
-            wall_lines, result.walls, result.rooms, config,
+            wall_lines, result.walls, room_geoms, config,
         )
         result.walls.extend(synth)
         result.stats.synth_wall_count = len(synth)
@@ -281,7 +334,8 @@ def separate_polygons(
     result.stats.merged_wall_count = len(merged)
 
     # Stage 7: outline (columns are already inside result.walls).
-    result.outline = _compute_outline(result.rooms, result.walls)
+    room_geoms = [r.geometry for r in result.rooms if isinstance(r.geometry, Polygon)]
+    result.outline = _compute_outline(room_geoms, result.walls)
 
     logger.info(
         "Separator: small_walls=%d walls=%d rooms=%d columns_in_walls=%d "
@@ -412,6 +466,97 @@ def _classify_columns(
         columns.append(p)
 
     return columns, remaining
+
+
+def _instance_centroids(
+    primitives: list[FloorplanPrimitive],
+) -> list[tuple[int, "BaseGeometry"]]:
+    """Group primitives by instance_id and return one (semantic_id, centroid)
+    pair per instance.
+
+    A single physical object (one toilet, one sofa, one elevator) is drawn
+    as many primitives sharing the same instance_id. Per-primitive
+    centroids scatter across the object's drawing strokes; the average is
+    far more likely to land near the object's true center, which in turn
+    is far more likely to be inside the room polygon — so an instance-
+    level test is robust where a primitive-level test misses on edge
+    pieces.
+
+    Primitives without an instance_id (None or < 0) are treated as
+    one-primitive instances so we don't drop them entirely.
+    """
+    groups: dict[tuple[int, int], list[FloorplanPrimitive]] = {}
+    pseudo_id = -2
+    for prim in primitives:
+        if prim.geometry is None or prim.geometry.is_empty:
+            continue
+        sem = prim.semantic_id if prim.semantic_id is not None else -1
+        if prim.instance_id is None or prim.instance_id < 0:
+            key = (pseudo_id, sem)
+            pseudo_id -= 1
+        else:
+            key = (prim.instance_id, sem)
+        groups.setdefault(key, []).append(prim)
+
+    out: list[tuple[int, "BaseGeometry"]] = []
+    for (_, sem), prims in groups.items():
+        try:
+            union = unary_union([p.geometry for p in prims])
+        except Exception:  # noqa: BLE001
+            continue
+        if union.is_empty:
+            continue
+        c = union.centroid
+        if c.is_empty:
+            continue
+        out.append((sem, c))
+    return out
+
+
+def _lock_object_rooms(
+    polygons: list[Polygon],
+    primitives: list[FloorplanPrimitive],
+    hatched_ids: set[int],
+) -> tuple[set[int], dict[int, dict[int, int]], int]:
+    """Inc 12: lock polygons containing object-instance centroids as
+    100%-rooms.
+
+    Tests one centroid per instance (see `_instance_centroids`) against
+    polygon interiors with `contains`. Hatching wins ties: a polygon
+    already in `hatched_ids` is skipped (stray-object case stays a wall).
+
+    Returns:
+        (locked_ids, semantics, overruled_count)
+        locked_ids: set of id(polygon) classified as 100%-room.
+        semantics: id(polygon) -> {semantic_id: count_of_instances} for
+                   Inc 13 to consume. Counts are now per-instance, not
+                   per-primitive.
+        overruled_count: how many object-bearing polygons were rejected
+                         because they were also hatched.
+    """
+    if not polygons or not primitives:
+        return set(), {}, 0
+
+    tree = STRtree(polygons)
+    locked: set[int] = set()
+    semantics: dict[int, dict[int, int]] = {}
+    overruled: set[int] = set()
+
+    for sem, pt in _instance_centroids(primitives):
+        for idx in tree.query(pt):
+            poly = polygons[int(idx)]
+            if not poly.contains(pt):
+                continue
+            poly_key = id(poly)
+            if poly_key in hatched_ids:
+                overruled.add(poly_key)
+                break
+            locked.add(poly_key)
+            counts = semantics.setdefault(poly_key, {})
+            counts[sem] = counts.get(sem, 0) + 1
+            break
+
+    return locked, semantics, len(overruled)
 
 
 def _match_hatching_to_polygons(
