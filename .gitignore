@@ -1,3 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Project data — SVGs are large, outputs are generated
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+
 *.svg
 *.geojson
-.idea
+
+# IDE
+.idea/
+.vscode/
+
+# Plan files — local working docs
+plan/
+!plan/.gitkeep
+
+# OS
+.DS_Store
+
+# uv
+uv.lock
