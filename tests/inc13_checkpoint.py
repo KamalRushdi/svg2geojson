@@ -115,15 +115,28 @@ def _parse_rgb(stroke: str | None, fallback: str):
 
 
 def _compute_bounds(lines):
-    max_x = 0.0
-    max_y = 0.0
+    """Return (min_x, min_y, max_x, max_y) over all line coords, or None if
+    the input is empty. The plot uses the full extent (not just max) so
+    samples with non-zero viewBox offsets — e.g. CRS-georeferenced floor
+    plans where x≈850000, y≈-3924000 — render correctly instead of
+    landing entirely outside a (0, viewbox_height)² window.
+    """
+    min_x = min_y = float("inf")
+    max_x = max_y = float("-inf")
     for ls in lines:
         for c in ls.coords:
-            if c[0] > max_x:
-                max_x = c[0]
-            if c[1] > max_y:
-                max_y = c[1]
-    return max_x, max_y
+            x, y = c[0], c[1]
+            if x < min_x:
+                min_x = x
+            if x > max_x:
+                max_x = x
+            if y < min_y:
+                min_y = y
+            if y > max_y:
+                max_y = y
+    if min_x == float("inf"):
+        return None
+    return min_x, min_y, max_x, max_y
 
 
 def _fill_polygon(ax, poly: Polygon, *, facecolor, edgecolor="black",
@@ -160,9 +173,16 @@ def plot_three_panel(
     save_path, sample_name, viewbox_height, boundary_rects=None,
     classification_primitives=None,
 ):
-    mx, _ = _compute_bounds(noded_lines)
-    xlim = mx * 1.05 if mx > 0 else viewbox_height * 1.5
-    ylim = viewbox_height
+    bounds = _compute_bounds(noded_lines)
+    if bounds is None:
+        xlim_lo, xlim_hi = 0.0, viewbox_height * 1.5
+        ylim_lo, ylim_hi = 0.0, viewbox_height
+    else:
+        bx0, by0, bx1, by1 = bounds
+        pad_x = max((bx1 - bx0) * 0.025, 1e-3)
+        pad_y = max((by1 - by0) * 0.025, 1e-3)
+        xlim_lo, xlim_hi = bx0 - pad_x, bx1 + pad_x
+        ylim_lo, ylim_hi = by0 - pad_y, by1 + pad_y
 
     fig, axes = plt.subplots(1, 3, figsize=(30, 12))
     ax1, ax2, ax3 = axes
@@ -273,8 +293,8 @@ def plot_three_panel(
 
     for ax in axes:
         ax.set_aspect("equal")
-        ax.set_xlim(0, xlim)
-        ax.set_ylim(0, ylim)
+        ax.set_xlim(xlim_lo, xlim_hi)
+        ax.set_ylim(ylim_lo, ylim_hi)
         if boundary_rects:
             for rect in boundary_rects:
                 xs, ys = rect.xy

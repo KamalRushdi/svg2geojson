@@ -132,6 +132,20 @@ def parse_svg(
         if prim is not None:
             result.all_primitives.append(prim)
 
+    # --- Translate to origin if viewBox has a non-zero offset ---
+    # Working-plan SVGs come with georeferenced viewBoxes, e.g.
+    #   viewBox="850192 3924494 4200 4200"  (HKÜ — UTM-ish)
+    # which puts coordinates in the millions and breaks downstream
+    # tolerances/heuristics (snap_tolerance, min_line_length, etc.) that
+    # assume drawing-unit-scale numbers near origin. Shift all primitives
+    # by -(vb_x, vb_y) so data lives in [0, W] × [0, H], then continue
+    # with the standard y-flip on the height-W viewBox.
+    if vb[0] != 0.0 or vb[1] != 0.0:
+        result.all_primitives = [
+            _translate(p, -vb[0], -vb[1]) for p in result.all_primitives
+        ]
+        vb = (0.0, 0.0, vb[2], vb[3])
+
     # --- Y-flip: SVG Y-down to geometry Y-up ---
     if config.y_flip:
         result.all_primitives = [
@@ -451,6 +465,29 @@ def _parse_arc(d_attr: str, arc_resolution: int) -> LineString | None:
         points.append((x, y))
 
     return LineString(points)
+
+
+def _translate(
+    prim: FloorplanPrimitive, dx: float, dy: float,
+) -> FloorplanPrimitive:
+    """Shift a primitive's geometry by (dx, dy) without altering metadata.
+
+    Used to move SVG-coordinate data to the origin when the viewBox has a
+    non-zero (min_x, min_y) offset (common in georeferenced floor plans).
+    """
+    from shapely.affinity import affine_transform
+
+    moved = affine_transform(prim.geometry, [1, 0, 0, 1, dx, dy])
+
+    return FloorplanPrimitive(
+        geometry=moved,
+        semantic_id=prim.semantic_id,
+        instance_id=prim.instance_id,
+        primitive_id=prim.primitive_id,
+        original_type=prim.original_type,
+        layer=prim.layer,
+        stroke=prim.stroke,
+    )
 
 
 def _flip_y(prim: FloorplanPrimitive, viewbox_height: float) -> FloorplanPrimitive:
