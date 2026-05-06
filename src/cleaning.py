@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.spatial import cKDTree
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Polygon
 from shapely.ops import unary_union
 
 from src.config import CleaningConfig
@@ -76,11 +76,22 @@ def clean_geometry(
 
     stats = CleaningStats()
 
-    # Extract LineStrings, skip non-LineString geometries
+    # Extract LineStrings + convert closed Polygons (e.g. circle/ellipse
+    # boundary primitives) to ring LineStrings so they participate in
+    # polygonization. A round structural column drawn as <circle> reaches
+    # us as a buffered Point (Polygon); without this conversion, walls
+    # ending at the column would be dangles and the adjacent room would
+    # fail to close. The polygon's exterior ring becomes a closed
+    # LineString that polygonize_full can use as a normal wall edge.
     lines: list[LineString] = []
     for p in primitives:
-        if isinstance(p.geometry, LineString):
-            lines.append(p.geometry)
+        g = p.geometry
+        if isinstance(g, LineString):
+            lines.append(g)
+        elif isinstance(g, Polygon) and not g.is_empty:
+            ring = LineString(g.exterior.coords)
+            if not ring.is_empty:
+                lines.append(ring)
         else:
             stats.non_linestring_skipped += 1
     stats.input_count = len(lines)
