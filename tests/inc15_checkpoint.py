@@ -140,8 +140,8 @@ def plot_two_panel(parse_result, noded_lines, sep, absorbed,
         fontsize=10,
     )
 
-    # Panel 2: Inc 15 output (arc doors absorbed)
-    _draw_classified(ax2, absorbed.rooms, sep.merged_walls,
+    # Panel 2: Inc 15 output (arc doors absorbed, walls clipped)
+    _draw_classified(ax2, absorbed.rooms, absorbed.walls,
                      absorbed.doors, sep.windows, semantic_color,
                      absorbed_geoms=absorbed.absorbed_door_geoms)
     summary_after = classification_summary(absorbed.rooms)
@@ -226,7 +226,7 @@ def main():
         reclassify_kitchen_near_wc(sep.rooms)
         classify_by_geometry(sep.rooms)
 
-        absorbed = absorb_arc_doors(sep.rooms, sep.doors)
+        absorbed = absorb_arc_doors(sep.rooms, sep.doors, sep.merged_walls)
 
         print_summary(sample_name, sep, absorbed)
 

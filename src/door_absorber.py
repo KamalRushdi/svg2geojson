@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 
 from shapely.geometry import LineString, MultiPolygon, Polygon, box
+from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
 from src.models import RoomPolygon
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 class AbsorptionResult:
     rooms: list[RoomPolygon]
     doors: list[RoomPolygon]
+    walls: list[Polygon]
     absorbed_count: int = 0
     orphan_count: int = 0
     absorbed_door_geoms: list[Polygon] = None  # type: ignore[assignment]
@@ -58,6 +60,16 @@ def _split_door_at_room_side(
     minx, miny, maxx, maxy = door.bounds
     cx = (minx + maxx) / 2.0
     cy = (miny + maxy) / 2.0
+    width = maxx - minx
+    height = maxy - miny
+
+    # Skip absorption for thin doors — their thickness (short side of
+    # the bbox) is below the wall-thickness floor, so the door already
+    # sits flush with the wall edge and cutting would do more harm than
+    # good.
+    thickness = min(width, height)
+    if thickness < 2.3:
+        return None, door
 
     # Step 1: pick the edge with the longest intersection against the
     # chosen room's boundary. This gives us an edge that's known to
@@ -100,18 +112,25 @@ def _split_door_at_room_side(
         if on_hinge_side:
             best_side = opposite[best_side]
 
+    # Fraction of the door's depth that the room absorbs. The remaining
+    # (1 - frac) stays in the wall as a visible door rectangle.
+    absorb_frac = 0.75
     if best_side == "top":
-        room_box = box(minx, cy, maxx, maxy)
-        wall_box = box(minx, miny, maxx, cy)
+        cut_y = maxy - absorb_frac * (maxy - miny)
+        room_box = box(minx, cut_y, maxx, maxy)
+        wall_box = box(minx, miny, maxx, cut_y)
     elif best_side == "bottom":
-        room_box = box(minx, miny, maxx, cy)
-        wall_box = box(minx, cy, maxx, maxy)
+        cut_y = miny + absorb_frac * (maxy - miny)
+        room_box = box(minx, miny, maxx, cut_y)
+        wall_box = box(minx, cut_y, maxx, maxy)
     elif best_side == "left":
-        room_box = box(minx, miny, cx, maxy)
-        wall_box = box(cx, miny, maxx, maxy)
+        cut_x = minx + absorb_frac * (maxx - minx)
+        room_box = box(minx, miny, cut_x, maxy)
+        wall_box = box(cut_x, miny, maxx, maxy)
     else:  # right
-        room_box = box(cx, miny, maxx, maxy)
-        wall_box = box(minx, miny, cx, maxy)
+        cut_x = maxx - absorb_frac * (maxx - minx)
+        room_box = box(cut_x, miny, maxx, maxy)
+        wall_box = box(minx, miny, cut_x, maxy)
 
     try:
         room_half = door.intersection(room_box)
@@ -124,6 +143,7 @@ def _split_door_at_room_side(
 def absorb_arc_doors(
     rooms: list[RoomPolygon],
     doors: list[RoomPolygon],
+    walls: list[Polygon] | None = None,
 ) -> AbsorptionResult:
     """Merge arc-bearing doors into the room with the longest shared boundary.
 
@@ -131,11 +151,14 @@ def absorb_arc_doors(
         rooms:  RoomPolygons from the separator (with facil_type already set).
         doors:  RoomPolygons (facil_type="Door"), with `has_arc` populated by
                 door_closer.
+        walls:  Wall polygons (e.g. sep.merged_walls). Any wall area that
+                falls inside an absorbed door footprint is clipped away so
+                no gray sliver shows through inside what is now a room.
 
     Returns:
-        AbsorptionResult with possibly-mutated rooms, the remaining doors
-        (non-arc + arc orphans), counts, and the geometries that were
-        absorbed (for visualization overlay).
+        AbsorptionResult with possibly-mutated rooms, clipped walls, the
+        remaining doors (non-arc + arc orphans), counts, and the
+        geometries that were absorbed (for visualization overlay).
     """
     out_rooms = [
         RoomPolygon(
@@ -206,6 +229,36 @@ def absorb_arc_doors(
             ))
         absorbed += 1
 
+    # Clip walls against everything that belongs inside a door slot:
+    # the absorbed (room) halves AND the original door bboxes. This
+    # removes both wall slivers swallowed by the room and stray slivers
+    # that polygonization left inside the wall_half (where the pink
+    # door rectangle would otherwise overlap with gray underneath).
+    out_walls: list[Polygon] = []
+    in_walls = list(walls or [])
+    clip_parts: list[BaseGeometry] = list(absorbed_geoms)
+    for door in doors:
+        if isinstance(door.geometry, (Polygon, MultiPolygon)):
+            clip_parts.append(door.geometry)
+    if clip_parts and in_walls:
+        clip_union = unary_union(clip_parts)
+        for w in in_walls:
+            try:
+                clipped = w.difference(clip_union)
+            except Exception:
+                clipped = w
+            if clipped.is_empty:
+                continue
+            if isinstance(clipped, MultiPolygon):
+                for p in clipped.geoms:
+                    if p.area > 1e-3:
+                        out_walls.append(p)
+            elif isinstance(clipped, Polygon):
+                if clipped.area > 1e-3:
+                    out_walls.append(clipped)
+    else:
+        out_walls = in_walls
+
     logger.info(
         "Door absorption: %d arc doors absorbed, %d orphan, %d non-arc passthrough",
         absorbed, orphan, len(remaining) - orphan,
@@ -214,6 +267,7 @@ def absorb_arc_doors(
     return AbsorptionResult(
         rooms=out_rooms,
         doors=remaining,
+        walls=out_walls,
         absorbed_count=absorbed,
         orphan_count=orphan,
         absorbed_door_geoms=absorbed_geoms,
