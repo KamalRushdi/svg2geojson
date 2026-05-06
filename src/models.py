@@ -82,6 +82,8 @@ class RoomPolygon:
     facil_name: str | None = None
     stroke: str | None = None
     contained_semantics: dict[int, int] = field(default_factory=dict)
+    has_arc: bool = False
+    hinge: BaseGeometry | None = None  # Point at the arc circle center
 
 
 # ---------------------------------------------------------------------------

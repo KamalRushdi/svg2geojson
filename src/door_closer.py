@@ -32,7 +32,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 import numpy as np
-from shapely.geometry import LineString, MultiPoint, Polygon, box
+from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
 
 from src.config import DoorClosingConfig
 from src.models import FloorplanPrimitive, RoomPolygon
@@ -110,9 +110,15 @@ def close_openings(
 
         edges = _extract_rect_edges(rect, iid, prims[0].semantic_id)
         result.door_edges.extend(edges)
+        has_arc = any(p.original_type == "arc" for p in prims)
+        hinge = _compute_hinge(prims) if has_arc else None
         result.door_polygons.append(
             RoomPolygon(
-                geometry=rect, facil_type="Door", stroke=prims[0].stroke
+                geometry=rect,
+                facil_type="Door",
+                stroke=prims[0].stroke,
+                has_arc=has_arc,
+                hinge=hinge,
             )
         )
         result.door_count += 1
@@ -429,6 +435,52 @@ def _build_bbox_rect(
         return None
 
     return rect
+
+
+def _circumcenter(
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+) -> tuple[float, float] | None:
+    """Center of the circle through 3 points; None if colinear."""
+    ax, ay = p1
+    bx, by = p2
+    cx, cy = p3
+    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) < 1e-9:
+        return None
+    a2 = ax * ax + ay * ay
+    b2 = bx * bx + by * by
+    c2 = cx * cx + cy * cy
+    ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d
+    uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d
+    return (ux, uy)
+
+
+def _compute_hinge(prims: list[FloorplanPrimitive]) -> Point | None:
+    """Hinge of a door instance = center of the swing arc's circle.
+
+    Picks the longest arc primitive in the instance, takes 3 points along
+    its polyline (start / middle / end), and returns the circle center.
+    Returns None if there's no arc or the 3 points are degenerate.
+    """
+    arcs = [
+        p.geometry for p in prims
+        if p.original_type == "arc"
+        and isinstance(p.geometry, LineString)
+        and len(p.geometry.coords) >= 3
+    ]
+    if not arcs:
+        return None
+    best = max(arcs, key=lambda g: g.length)
+    coords = list(best.coords)
+    p1 = coords[0]
+    p2 = coords[len(coords) // 2]
+    p3 = coords[-1]
+    center = _circumcenter(p1, p2, p3)
+    if center is None:
+        return None
+    return Point(center)
 
 
 def _rect_dimensions(rect: Polygon) -> tuple[float, float]:

@@ -404,20 +404,37 @@ def _split_off_openings(
                 return int(j)
         return None
 
+    # Polygonization can fragment one door/window AABB into multiple shards
+    # (cleaning/noding adds extra cuts). Group shards by source AABB index
+    # so each physical door/window emits ONE RoomPolygon — otherwise
+    # downstream absorption would pick a different adjacent room per shard.
+    door_groups: dict[int, list[Polygon]] = {}
+    window_groups: dict[int, list[Polygon]] = {}
     for p in candidates:
         di = _match(p, door_aabbs, door_tree)
         if di is not None:
-            doors.append(RoomPolygon(
-                geometry=p, facil_type="Door", stroke=door_sources[di].stroke,
-            ))
+            door_groups.setdefault(di, []).append(p)
             continue
         wi = _match(p, window_aabbs, window_tree)
         if wi is not None:
-            windows.append(RoomPolygon(
-                geometry=p, facil_type="Window", stroke=window_sources[wi].stroke,
-            ))
+            window_groups.setdefault(wi, []).append(p)
             continue
         remaining.append(p)
+
+    for di, shards in door_groups.items():
+        geom = unary_union(shards) if len(shards) > 1 else shards[0]
+        doors.append(RoomPolygon(
+            geometry=geom, facil_type="Door",
+            stroke=door_sources[di].stroke,
+            has_arc=door_sources[di].has_arc,
+            hinge=door_sources[di].hinge,
+        ))
+    for wi, shards in window_groups.items():
+        geom = unary_union(shards) if len(shards) > 1 else shards[0]
+        windows.append(RoomPolygon(
+            geometry=geom, facil_type="Window",
+            stroke=window_sources[wi].stroke,
+        ))
     return doors, windows, remaining
 
 
