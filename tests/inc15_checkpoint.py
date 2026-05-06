@@ -45,6 +45,7 @@ from src.hatching_filter import filter_hatching
 from src.polygonizer import polygonize_lines
 from src.separator import separate_polygons
 from src.svg_parser import parse_svg
+from src.svg_writer import write_floorplan_svg
 from tests.inc13_checkpoint import (
     UNCLASSIFIED_EDGE,
     UNCLASSIFIED_FILL,
@@ -234,6 +235,16 @@ def main():
             result, cleaning.lines, sep, absorbed,
             OUTPUT_DIR / f"{sample_name}_absorbed.png",
             sample_name, result.viewbox_height,
+        )
+
+        bounds = _compute_bounds(cleaning.lines)
+        if bounds is None:
+            bounds = (0.0, 0.0, result.viewbox_height,
+                      result.viewbox_height)
+        write_floorplan_svg(
+            OUTPUT_DIR / f"{sample_name}_classified.svg",
+            absorbed.rooms, absorbed.walls,
+            absorbed.doors, sep.windows, bounds,
         )
 
     print("\nDone. Outputs in", OUTPUT_DIR)
